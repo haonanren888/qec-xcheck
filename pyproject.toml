@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qec-xcheck"
+version = "0.4.0"
+description = "Checks that QEC circuit conversions do not silently change measurements, detectors, or classical controls, and reports whether enumerated DEM fault weights produced a decoder counterexample."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+stim = ["stim>=1.13", "stimcirq", "sinter"]
+cirq = ["cirq"]
+qiskit = ["qiskit>=2", "qiskit-qasm3-import"]
+test = ["pytest>=7"]
+distance = ["numpy>=1.21", "pymatching>=2.4.0", "stim>=1.13"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["xcheck*"]
