@@ -1,0 +1,48 @@
+name: xcheck
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  known:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+        track: ["stable", "pre"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ matrix.track }}" = "pre" ]; then
+            python -m pip install --upgrade --pre -e ".[stim,cirq,qiskit,test,distance]"
+          else
+            python -m pip install --upgrade -e ".[stim,cirq,qiskit,test,distance]"
+          fi
+      - name: Unit tests
+        run: python -m pytest -q
+      - name: Known-defect regression
+        run: |
+          set +e
+          python -m xcheck known > known-report.txt
+          code=$?
+          echo "exit_code=${code}" >> known-report.txt
+          if [ "$code" -gt 1 ]; then
+            exit "$code"
+          fi
+          exit 0
+      - name: Upload known report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: known-py${{ matrix.python-version }}-${{ matrix.track }}
+          path: known-report.txt
