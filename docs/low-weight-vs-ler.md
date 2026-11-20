@@ -4,7 +4,7 @@ A logical error rate counts shots that are logically wrong at one physical noise
 
 ## Versions
 
-The commands below are qec-xcheck 0.4.0 (`version` in `pyproject.toml`, `__version__` in `xcheck/__init__.py`, and the `0.4.0` heading in `CHANGELOG.md`). Ordinary matching leaves correlations off. Correlated matching sets `enable_correlations=True` both when the matcher is built and when it decodes. Each distance command prints a `versions:` line. On Python 3.12.13 the recorded line was `numpy=2.2.6 pymatching=2.4.0 stim=1.17.dev1793242987 xcheck=0.4.0`. Another build can change the counts. Re-run, and keep the new line with the new counts. Exit codes are defined in the README.
+The counts below were recorded with qec-xcheck 0.4.0. The package version is the `version` field in `pyproject.toml`, `__version__` in `xcheck/__init__.py`, and the current heading in `CHANGELOG.md`. Ordinary matching leaves correlations off. Correlated matching sets `enable_correlations=True` both when the matcher is built and when it decodes. Each distance command prints a `versions:` line. On Python 3.12.13 the recorded line was `numpy=2.2.6 pymatching=2.4.0 stim=1.17.dev1793242987 xcheck=0.4.0`. Another build can change the counts. Re-run, and keep the new line with the new counts. Exit codes are defined in the README.
 
 ## Two noise strengths
 

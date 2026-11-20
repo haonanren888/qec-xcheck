@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.1 — 2026-11-20
+
+- When `--timeout` stops pair enumeration after counterexamples were found, the text output reports `pair_failures: partial (N failing pairs found before the timeout; ...)` instead of "not enumerated", and the JSON adds `pair_failures_found_before_timeout`.
+
+- **Upgrade note:** 0.4.0 reported `EXHAUSTIVE_NONE` (exit 0) on circuits whose Stim search result is below 3, although no fault was tested, and wrote 0 instead of null for weights that were not enumerated. Please upgrade.
+
+- A Stim search result below 3 makes the default cutoff 0. That run is now `UNAVAILABLE` (exit 4). The message is `0 faults tested; Stim search result is <n>, so the derived cutoff is 0; use --max-weight 1 to test single faults`. It is not `EXHAUSTIVE_NONE` and it does not use the no-counterexample scope sentence. `--max-weight 1` enumerates single faults and reports that result.
+- When a run does not enumerate weight 2, JSON `pairs_tested` and `pair_failures` are null and `enumeration_note` is set. The text line stays `not enumerated`. A pair-limit stop still reports `pairs_tested` 0, because zero pairs were checked, with `pair_failures` null.
+- A custom factory that raises, or a `custom:` module that fails to import, is `UNAVAILABLE` (exit 4). The message keeps the exception type and the original text. An import failure names the module and, under `python -I`, says that isolated mode left it off `sys.path`. A bad spec or another parameter error is still exit 2.
+- `--timeout SECONDS` stops the check. The status is `TIMEOUT` (exit 4) when no counterexample was found before the deadline. A counterexample found before the deadline stays `COUNTEREXAMPLE` (exit 1) and keeps its lines. Neither text is "no counterexample within the stated scope".
+- `python -m xcheck --help` and `python -m xcheck distance --help` exit 0.
+- The `cirq` extra now installs `ply`, which Cirq's QASM importer needs for the Cirq #8530 check. With 0.4.0 that row was `ERROR` (exit 2 for `known`) after a clean install of the extras.
+- `LICENSE` is the Apache-2.0 license text. `NOTICE` sits beside it. The `license` field in `pyproject.toml` still points at `LICENSE`.
+- The README says how to place a `custom:` module on `sys.path` under `python -I`, and gives two short adapters: cast a `bool` prediction to `uint8`, and split sinter `BUILT_IN_DECODERS["fusion_blossom"]` bit-packed observables into one column per observable.
+
 ## 0.4.0 — 2026-11-19
 
 - Add `python -m xcheck distance`. One fault is one DEM error mechanism after `detector_error_model(decompose_errors=True)`. One correlated fault counts as 1. Faults are not counted by decomposed graph edges. The distance line is a Stim search result (upper bound from the stated search).

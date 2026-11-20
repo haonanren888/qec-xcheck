@@ -40,7 +40,7 @@ The `distance` extra installs `stim>=1.13`, `numpy>=1.21`, and `pymatching>=2.4.
 | 1 | `COUNTEREXAMPLE`, or a non-distance check did not match |
 | 2 | usage or runtime error, including `DECODER_OUTPUT_INVALID` |
 | 3 | `SAMPLED_NONE` (`not a guarantee`) |
-| 4 | `UNAVAILABLE` |
+| 4 | `UNAVAILABLE` or `TIMEOUT` |
 
 # qec-xcheck
 
@@ -74,7 +74,7 @@ python -m xcheck distance --circuit examples/rotated_memory_z_d3_r3.stim --decod
 
 `distance` does not use that scale. It exits `0` for `EXHAUSTIVE_NONE`, `1` for `COUNTEREXAMPLE`, `2` on a usage error, `3` for `SAMPLED_NONE`, and `4` for `UNAVAILABLE`. The next section defines those words.
 
-From a checkout, a normal `python -m xcheck` finds this package because Python puts the working directory on the module path. Isolated mode (`python -I`) does not, so use an installed copy for that mode.
+From a checkout, a normal `python -m xcheck` finds this package because Python puts the working directory on the module path. Isolated mode (`python -I`) drops `PYTHONPATH` and does not put the working directory on `sys.path`. Insert the checkout and the directory that contains a `custom:` module into `sys.path` before importing them. See the custom-decoder section below.
 
 `PASS` means this install matches the cited spec. `FAIL` means the published defect is still present. `UNAVAILABLE` means a saved reproduction needs a component this interpreter does not have.
 
@@ -111,10 +111,11 @@ The distance line is `Stim search result (upper bound from the stated search)`. 
 | `COUNTEREXAMPLE` | 1 | At least one enumerated fault disagreed. JSON `counterexamples` holds up to eight DEM texts, and the text output prints those lines. |
 | `EXHAUSTIVE_NONE` | 0 | The stated weight range was fully enumerated and no counterexample was found. The text is `no counterexample found within the stated scope (versions, noise model, enumerated weights)`. |
 | `SAMPLED_NONE` | 3 | `--sample-pairs` was set, the sample contained no counterexample, and the text includes `not a guarantee` plus the sampling ratio `pairs_tested/pair_space`. |
-| `UNAVAILABLE` | 4 | The check could not be evaluated: missing `stim`, `numpy`, `pymatching`, or `tesseract_decoder`; correlated matching does not provide `enable_correlations`; Stim returned no logical-error length and neither `--max-weight` nor `--sample-pairs` was set; or the weight-2 pair count is above the limit, `--sample-pairs` was not set, and no counterexample was found at a lower weight. The default limit is 2000000 pairs. `--max-pairs N` raises it. The pair-limit message gives the pair count, an estimated exhaustive time from a local timing of the decoder, and suggested `--sample-pairs` and `--max-pairs` commands. If a lower weight already produced a counterexample, the status stays `COUNTEREXAMPLE` and the text notes `weight 2: not enumerated (0 pairs checked, reason ...)`. |
+| `UNAVAILABLE` | 4 | The check could not be evaluated: missing `stim`, `numpy`, `pymatching`, or `tesseract_decoder`; correlated matching does not provide `enable_correlations`; Stim returned no logical-error length and neither `--max-weight` nor `--sample-pairs` was set; the derived cutoff is 0 because the Stim search result is below 3; a `custom:` module failed to import or its factory raised; or the weight-2 pair count is above the limit, `--sample-pairs` was not set, and no counterexample was found at a lower weight. A cutoff of 0 says `0 faults tested; Stim search result is <n>, so the derived cutoff is 0; use --max-weight 1 to test single faults` and does not use the no-counterexample sentence. The default pair limit is 2000000. `--max-pairs N` raises it. The pair-limit message gives the pair count, an estimated exhaustive time from a local timing of the decoder, and suggested `--sample-pairs` and `--max-pairs` commands. If a lower weight already produced a counterexample, the status stays `COUNTEREXAMPLE` and the text notes `weight 2: not enumerated (0 pairs checked, reason ...)`. |
+| `TIMEOUT` | 4 | `--timeout SECONDS` expired before the requested weights finished, and no counterexample had been found. The text does not say the scope had no counterexample. A counterexample found before the deadline stays `COUNTEREXAMPLE` (exit 1), with its lines kept. |
 | `DECODER_OUTPUT_INVALID` | 2 | `decode_batch` returned `None`, the wrong rank, the wrong shape, a value other than 0 or 1, or raised. The message contains `expected (rows, observables) got ...`. |
 
-Usage errors exit 2: a bad argument, `--max-weight` outside 1 or 2, a missing or unreadable circuit file, a `custom:` target that cannot be imported, a DEM with no observables, or a DEM with no error mechanisms. `DECODER_OUTPUT_INVALID` is also exit 2. `--sample-pairs` never exits 0. It is `SAMPLED_NONE` or `COUNTEREXAMPLE` only, including when the requested sample happens to cover every pair. `--json` prints one JSON object.
+Usage errors exit 2: a bad argument, `--max-weight` outside 1 or 2, `--timeout` that is not a positive number of seconds, a missing or unreadable circuit file, a `custom:` spec that is not `custom:module:function`, a DEM with no observables, or a DEM with no error mechanisms. A custom module that cannot be imported, or a factory that raises while it is built, is `UNAVAILABLE` (exit 4); the message keeps the exception type and the original text. `DECODER_OUTPUT_INVALID` is also exit 2. `--sample-pairs` never exits 0. It is `SAMPLED_NONE` or `COUNTEREXAMPLE` only, including when the requested sample happens to cover every pair. `--json` prints one JSON object. When weight 2 is not part of the run, JSON `pairs_tested` and `pair_failures` are null and `enumeration_note` is set. The text line stays `pair_failures: not enumerated`. The pair-limit stop is separate: `pairs_tested` is 0 and `pair_failures` is null, with the reason the pair space was above the limit. `--help` exits 0.
 
 `toy-broken` is a built-in test decoder. It decodes with PyMatching, correlations off, then replaces the observable of DEM error mechanism 0 with that observable flipped on the first bit. Every other syndrome keeps the PyMatching prediction. A run that does not report `COUNTEREXAMPLE` for `toy-broken` is a broken check.
 
@@ -173,6 +174,51 @@ def factory(dem):
 
 ```bash
 python -m xcheck distance --circuit examples/rotated_memory_z_d3_r3.stim --decoder custom:my_decoder:factory
+```
+
+`python -I` does not put the working directory or `PYTHONPATH` on `sys.path`, so `custom:module:factory` cannot see `module` until that process inserts the directory which contains it:
+
+```python
+import sys
+sys.path.insert(0, "path/to/checkout")
+sys.path.insert(0, "path/to/custom/parent")
+from xcheck.__main__ import main
+raise SystemExit(main(["distance", "--circuit", "your.stim", "--decoder", "custom:module:factory"]))
+```
+
+If that import fails, the status is `UNAVAILABLE` (exit 4). The message names the module. When the interpreter is in isolated mode, it also says that `python -I` left the module off `sys.path`.
+
+A decoder that returns `bool` has to be cast to `uint8` before this check will accept it:
+
+```python
+import numpy as np
+
+def factory(dem):
+    decoder = build_bool_decoder(dem)
+
+    def decode_batch(dets):
+        return np.asarray(decoder.decode_batch(dets), dtype=np.uint8)
+
+    return decode_batch
+```
+
+Sinter's bit-packed decoders take packed detector bytes and return packed observable bytes. `sinter.BUILT_IN_DECODERS["fusion_blossom"]` is one entry point. Split those bytes into one column per observable:
+
+```python
+import numpy as np
+from sinter import BUILT_IN_DECODERS
+
+def factory(dem):
+    compiled = BUILT_IN_DECODERS["fusion_blossom"].compile_decoder_for_dem(dem=dem)
+
+    def decode_batch(dets):
+        dets = np.atleast_2d(np.asarray(dets, dtype=np.uint8))
+        packed = np.packbits(dets, axis=1, bitorder="little")
+        predicted = compiled.decode_shots_bit_packed(bit_packed_detection_event_data=packed)
+        columns = np.unpackbits(np.asarray(predicted, dtype=np.uint8), axis=1, bitorder="little")
+        return np.ascontiguousarray(columns[:, : dem.num_observables])
+
+    return decode_batch
 ```
 
 ## Known defects

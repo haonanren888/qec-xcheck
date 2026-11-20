@@ -18,8 +18,17 @@ Statuses and process exit codes:
 - ``EXHAUSTIVE_NONE`` — exit 0, the stated weight range was fully enumerated
 - ``SAMPLED_NONE`` — exit 3, a sample found no counterexample (``not a guarantee``)
 - ``UNAVAILABLE`` — exit 4, the check could not be evaluated
+- ``TIMEOUT`` — exit 4, ``--timeout`` stopped the check and no counterexample had been found yet
 - ``DECODER_OUTPUT_INVALID`` — exit 2, ``decode_batch`` broke its contract
 - usage errors — exit 2
+
+A derived cutoff of 0 (the Stim search result is below 3, and neither
+``--max-weight`` nor ``--sample-pairs`` was set) is ``UNAVAILABLE``. The
+message says that 0 faults were tested and names ``--max-weight 1``. It
+does not use the no-counterexample scope sentence.
+
+``--timeout`` stops the enumeration. A counterexample already found stays
+``COUNTEREXAMPLE`` (exit 1). Otherwise the status is ``TIMEOUT``.
 
 A counterexample found at any enumerated weight stays ``COUNTEREXAMPLE``.
 If a later weight is not run because of the pair budget, the output notes
@@ -56,8 +65,10 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -103,6 +114,71 @@ _ATTRIBUTION_KEYS = (
     "REFERENCE_ALSO_FAILS",
     "REFERENCE_UNAVAILABLE",
 )
+
+
+class _TimedOut(Exception):
+    """The ``--timeout`` budget ended before this call returned."""
+
+
+class _FactoryUnavailable(Exception):
+    """A custom factory could not be imported or constructed."""
+
+
+class _Deadline:
+    def __init__(self, seconds: float):
+        self.seconds = float(seconds)
+        self.started = time.perf_counter()
+
+    def expired(self) -> bool:
+        return (time.perf_counter() - self.started) >= self.seconds
+
+    def remaining(self) -> float:
+        return self.seconds - (time.perf_counter() - self.started)
+
+
+def _call_within(deadline: _Deadline | None, fn, *args):
+    """Run ``fn`` on this thread, or stop waiting when ``deadline`` expires.
+
+    The worker is a daemon so a decoder that is still running after the budget
+    does not hold the process open. No process is killed.
+    """
+    if deadline is None:
+        return fn(*args)
+    remaining = deadline.remaining()
+    if remaining <= 0:
+        raise _TimedOut()
+    box: dict = {}
+
+    def _run():
+        try:
+            box["value"] = fn(*args)
+        except Exception as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(remaining)
+    if thread.is_alive():
+        raise _TimedOut()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _custom_import_message(module_name: str, exc: BaseException) -> str:
+    detail = f"{type(exc).__name__}: {_short(exc)}"
+    if sys.flags.isolated:
+        why = (
+            "python -I drops PYTHONPATH and does not add the working directory "
+            "to sys.path. Insert the directory that contains the module into "
+            "sys.path before starting."
+        )
+    else:
+        why = (
+            "This interpreter is not in isolated mode (python -I). "
+            "The module was not found on sys.path."
+        )
+    return f"{detail}. custom module {module_name} failed to import. {why}"
 
 
 def _import_numpy():
@@ -544,8 +620,21 @@ def load_decoder(name: str, dem):
             _import_numpy()
         except ImportError:
             return None, "UNAVAILABLE: numpy is not installed"
-        factory = _load_custom(name)
-        return _as_decode_batch(factory(dem)), None
+        problem = custom_spec_error(name)
+        if problem:
+            raise ValueError(problem)
+        module_name, _, function_name = name[len("custom:") :].rpartition(":")
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            raise _FactoryUnavailable(_custom_import_message(module_name, exc)) from None
+        try:
+            factory = getattr(module, function_name)
+            if not callable(factory):
+                raise TypeError(f"{function_name} is not callable")
+            return _as_decode_batch(factory(dem)), None
+        except Exception as exc:
+            raise _FactoryUnavailable(f"{type(exc).__name__}: {_short(exc)}") from None
     raise ValueError(f"unknown decoder {name}")
 
 
@@ -606,6 +695,7 @@ def _check_pairs(
     examples: list,
     counts: dict,
     reference,
+    deadline: _Deadline | None = None,
 ) -> dict:
     np = _import_numpy()
     syndromes = faults["syndromes"]
@@ -613,6 +703,18 @@ def _check_pairs(
     texts = faults["texts"]
     n = int(syndromes.shape[0])
     total = n * (n - 1) // 2
+
+    def _decode(block):
+        if deadline is not None and deadline.expired():
+            raise _TimedOut()
+        return _call_within(
+            deadline,
+            _call_decode,
+            decode_batch,
+            block,
+            int(faults["n_observables"]),
+        )
+
     if n < 2 or total == 0:
         return {"pair_space": total, "pairs_tested": 0, "pair_failures": 0, "exhaustive": True}
     if sample_pairs is None or sample_pairs >= total:
@@ -623,9 +725,7 @@ def _check_pairs(
             true_obs = np.bitwise_xor(observables[left + 1 :], observables[left])
             for start in range(0, syndrome.shape[0], _PAIR_CHUNK):
                 stop = min(start + _PAIR_CHUNK, syndrome.shape[0])
-                predicted = _call_decode(
-                    decode_batch, syndrome[start:stop], int(faults["n_observables"])
-                )
+                predicted = _decode(syndrome[start:stop])
                 mask = _mismatch(predicted, true_obs[start:stop])
                 failures += _attribute_failures(
                     reference,
@@ -660,9 +760,7 @@ def _check_pairs(
         stop = min(start + _PAIR_CHUNK, len(left))
         syndrome = np.bitwise_xor(syndromes[left[start:stop]], syndromes[right[start:stop]])
         true_obs = np.bitwise_xor(observables[left[start:stop]], observables[right[start:stop]])
-        predicted = _call_decode(
-            decode_batch, syndrome, int(faults["n_observables"])
-        )
+        predicted = _decode(syndrome)
         mask = _mismatch(predicted, true_obs)
 
         def _item(rel, start=start, left=left, right=right):
@@ -723,6 +821,12 @@ def _stated_scope(
     return scope
 
 
+def _timeout_message(seconds: float) -> str:
+    return (
+        f"TIMEOUT: stopped after {seconds:g}s before the stated weights were fully enumerated"
+    )
+
+
 def run_check(
     circuit_label: str,
     circuit,
@@ -730,6 +834,7 @@ def run_check(
     max_weight: int | None = None,
     sample_pairs: int | None = None,
     max_pairs: int | None = None,
+    timeout: float | None = None,
 ) -> dict:
     if max_weight is not None and int(max_weight) not in (1, 2):
         return _usage(decoder, circuit_label, "max-weight must be 1 or 2")
@@ -786,8 +891,68 @@ def run_check(
         checked = 0
     if checked > 2:
         checked = 2
+    if max_weight is None and sample_pairs is None and checked < 1:
+        shown = int(search_result)
+        faults_for_scope = extract_faults(dem)
+        message = (
+            f"0 faults tested; Stim search result is {shown}, "
+            f"so the derived cutoff is {int(checked)}; "
+            "use --max-weight 1 to test single faults"
+        )
+        payload = _unavailable(decoder, message, circuit_label)
+        payload["stated_scope"] = _stated_scope(
+            decoder,
+            noise,
+            distance,
+            int(dem.num_observables),
+            int(faults_for_scope["syndromes"].shape[0]),
+            checked,
+            correctable,
+            None,
+        )
+        payload["checked_weight"] = int(checked)
+        payload["singles_tested"] = 0
+        payload["single_failures"] = 0
+        payload["pairs_tested"] = None
+        payload["pair_failures"] = None
+        payload["enumeration_note"] = (
+            "weight 2: not enumerated (0 faults tested; derived cutoff is 0)"
+        )
+        return payload
+    deadline = None if timeout is None else _Deadline(float(timeout))
     try:
-        decode_batch, unavailable = load_decoder(decoder, dem)
+        decode_batch, unavailable = _call_within(deadline, load_decoder, decoder, dem)
+    except _TimedOut:
+        payload = _unavailable(decoder, _timeout_message(float(timeout)), circuit_label)
+        payload["status"] = "TIMEOUT"
+        payload["message"] = _timeout_message(float(timeout))
+        payload["stated_scope"] = _stated_scope(
+            decoder,
+            noise,
+            distance,
+            int(dem.num_observables),
+            None,
+            checked,
+            correctable,
+            None,
+        )
+        payload["checked_weight"] = checked
+        payload["singles_tested"] = 0
+        payload["single_failures"] = 0
+        return payload
+    except _FactoryUnavailable as exc:
+        payload = _unavailable(decoder, f"UNAVAILABLE: {exc}", circuit_label)
+        payload["stated_scope"] = _stated_scope(
+            decoder,
+            noise,
+            distance,
+            int(dem.num_observables),
+            None,
+            checked,
+            correctable,
+            None,
+        )
+        return payload
     except _CorrelatedUnsupported as exc:
         payload = _unavailable(
             decoder,
@@ -841,8 +1006,12 @@ def run_check(
     try:
         if checked >= 1 and n_faults:
             started = time.perf_counter()
-            predicted = _call_decode(
-                decode_batch, faults["syndromes"], int(faults["n_observables"])
+            predicted = _call_within(
+                deadline,
+                _call_decode,
+                decode_batch,
+                faults["syndromes"],
+                int(faults["n_observables"]),
             )
             single_seconds = time.perf_counter() - started
             mask = _mismatch(predicted, faults["observables"])
@@ -952,7 +1121,66 @@ def run_check(
                 examples,
                 counts,
                 reference,
+                deadline,
             )
+    except _TimedOut:
+        scope = _stated_scope(
+            decoder,
+            noise,
+            distance,
+            int(faults["n_observables"]),
+            n_faults,
+            checked,
+            correctable,
+            None,
+        )
+        if examples:
+            if not examples[0].get("dem"):
+                raise RuntimeError("a counterexample was counted without DEM text")
+            note = (
+                f"enumeration stopped by timeout after {float(timeout):g}s; "
+                "counterexamples found before the timeout are kept"
+            )
+            result = {
+                "command": "distance",
+                "status": "COUNTEREXAMPLE",
+                "exit_code": 1,
+                "circuit": circuit_label,
+                "decoder": decoder,
+                "message": examples[0]["dem"],
+                "stated_scope": scope,
+                "checked_weight": checked,
+                "singles_tested": singles_tested,
+                "single_failures": int(single_failures),
+                "pair_space": int(pair_space),
+                "pairs_tested": None,
+                "pair_failures": None,
+                "pair_failures_found_before_timeout": int(sum(counts.values())) - int(single_failures),
+                "failure_count": int(sum(counts.values())),
+                "counterexamples": examples,
+                "attribution": counts,
+                "reference_decoder": "pymatching",
+                "enumeration_note": note,
+            }
+            if counts["REFERENCE_ALSO_FAILS"]:
+                result["attribution_hint"] = REFERENCE_ALSO_FAILS_HINT
+            if planted is not None:
+                result["toy_broken_fault_index"] = int(planted)
+            return result
+        payload = _unavailable(decoder, _timeout_message(float(timeout)), circuit_label)
+        payload["status"] = "TIMEOUT"
+        payload["message"] = _timeout_message(float(timeout))
+        payload["stated_scope"] = scope
+        payload["checked_weight"] = checked
+        payload["singles_tested"] = singles_tested
+        payload["single_failures"] = int(single_failures)
+        payload["pairs_tested"] = None
+        payload["pair_failures"] = None
+        payload["enumeration_note"] = (
+            f"enumeration stopped by timeout after {float(timeout):g}s; "
+            "weight 2: not enumerated"
+        )
+        return payload
     except _CorrelatedUnsupported as exc:
         payload = _unavailable(
             decoder,
@@ -1068,8 +1296,8 @@ def run_check(
         "singles_tested": singles_tested,
         "single_failures": int(single_failures),
         "pair_space": int(pair_info["pair_space"]),
-        "pairs_tested": int(pair_info["pairs_tested"]),
-        "pair_failures": int(pair_info["pair_failures"]),
+        "pairs_tested": int(pair_info["pairs_tested"]) if (sampling or checked >= 2) else None,
+        "pair_failures": int(pair_info["pair_failures"]) if (sampling or checked >= 2) else None,
         "failure_count": failure_count,
         "counterexamples": examples,
         "attribution": counts,
@@ -1079,6 +1307,10 @@ def run_check(
         result["attribution_hint"] = REFERENCE_ALSO_FAILS_HINT
     if planted is not None:
         result["toy_broken_fault_index"] = int(planted)
+    if not sampling and checked < 2:
+        result["enumeration_note"] = (
+            "weight 2: not enumerated (pair faults were not checked)"
+        )
     return result
 
 
@@ -1175,14 +1407,23 @@ def format_text(result: dict) -> str:
         lines.append(
             f"single_failures: {result.get('single_failures')}/{result.get('singles_tested')}"
         )
-        if scope.get("sampling_ratio") is None and int(result.get("checked_weight") or 0) < 2:
+        weight = int(result.get("checked_weight") or 0)
+        pairs_omitted = weight < 2 or result.get("pair_failures") is None
+        if result.get("pair_failures_found_before_timeout") is not None:
+            lines.append(
+                "pair_failures: partial ("
+                f"{result.get('pair_failures_found_before_timeout')} failing pairs found before the timeout; "
+                f"not all {result.get('pair_space')} pairs were checked)"
+            )
+        elif scope.get("sampling_ratio") is None and pairs_omitted:
             lines.append("pair_failures: not enumerated")
         else:
             lines.append(
                 "pair_failures: "
                 f"{result.get('pair_failures')}/{result.get('pairs_tested')}/{result.get('pair_space')}"
             )
-        lines.append(f"failure_count: {result.get('failure_count')}")
+        if result.get("failure_count") is not None:
+            lines.append(f"failure_count: {result.get('failure_count')}")
         if result.get("enumeration_note"):
             lines.append(str(result["enumeration_note"]))
     attribution = result.get("attribution")
@@ -1210,6 +1451,7 @@ def check_path(
     max_weight: int | None = None,
     sample_pairs: int | None = None,
     max_pairs: int | None = None,
+    timeout: float | None = None,
 ) -> dict:
     try:
         stim = _import_stim()
@@ -1229,6 +1471,7 @@ def check_path(
         max_weight=max_weight,
         sample_pairs=sample_pairs,
         max_pairs=max_pairs,
+        timeout=timeout,
     )
 
 
@@ -1254,6 +1497,12 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help=f"weight-2 pair limit (default {DEFAULT_MAX_PAIRS})",
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="stop after this many seconds; a counterexample already found is kept",
+    )
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -1263,7 +1512,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     except SystemExit as exc:
-        return 2 if exc.code is None else int(exc.code)
+        if exc.code in (0, None):
+            return 0
+        return int(exc.code)
     decoder = args.decoder
     known = decoder in _DECODERS or decoder.startswith("custom:")
     if not known or custom_spec_error(decoder):
@@ -1271,7 +1522,7 @@ def main(argv: list[str] | None = None) -> int:
             "usage: python -m xcheck distance --circuit <stim file> "
             "[--decoder pymatching|pymatching-correlated|tesseract|toy-broken|"
             "custom:module:function] "
-            "[--max-weight 1|2] [--sample-pairs N] [--max-pairs N] [--json]",
+            "[--max-weight 1|2] [--sample-pairs N] [--max-pairs N] [--timeout SEC] [--json]",
             file=sys.stderr,
         )
         return 2
@@ -1281,12 +1532,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_pairs is not None and args.max_pairs < 1:
         print("max-pairs must be a positive integer", file=sys.stderr)
         return 2
+    if args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0):
+        print("timeout must be a positive number of seconds", file=sys.stderr)
+        return 2
     result = check_path(
         args.circuit,
         decoder,
         max_weight=args.max_weight,
         sample_pairs=args.sample_pairs,
         max_pairs=args.max_pairs,
+        timeout=args.timeout,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))

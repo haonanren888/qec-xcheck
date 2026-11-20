@@ -17,8 +17,8 @@ on a usage or runtime error. `known` exits 1 when any executed check is FAIL.
 
 `distance` exits 0 for EXHAUSTIVE_NONE, 1 for COUNTEREXAMPLE, 2 on a
 usage error or DECODER_OUTPUT_INVALID, 3 for SAMPLED_NONE, and 4 for
-UNAVAILABLE. A counterexample already found stays exit 1 when a later
-weight is not enumerated.
+UNAVAILABLE or TIMEOUT. A counterexample already found stays exit 1 when
+a later weight is not enumerated or when `--timeout` fires. `--help` exits 0.
 """
 
 from __future__ import annotations
@@ -35,21 +35,26 @@ _CHECKS = (
 )
 
 
-def _usage() -> None:
-    print(
-        "usage: python -m xcheck known\n"
-        "       python -m xcheck cirq-classical-control [--oracle] <json-or-builtin:8525>\n"
-        "       python -m xcheck <stim-cirq-roundtrip|qasm3-roundtrip> <input>\n"
-        "       python -m xcheck distance --circuit <stim file> "
-        "[--decoder pymatching|pymatching-correlated|tesseract|toy-broken|custom:module:function] "
-        "[--max-weight 1|2] [--sample-pairs N] [--max-pairs N] [--json]",
-        file=sys.stderr,
-    )
+_USAGE = (
+    "usage: python -m xcheck known\n"
+    "       python -m xcheck cirq-classical-control [--oracle] <json-or-builtin:8525>\n"
+    "       python -m xcheck <stim-cirq-roundtrip|qasm3-roundtrip> <input>\n"
+    "       python -m xcheck distance --circuit <stim file> "
+    "[--decoder pymatching|pymatching-correlated|tesseract|toy-broken|custom:module:function] "
+    "[--max-weight 1|2] [--sample-pairs N] [--max-pairs N] [--timeout SEC] [--json]"
+)
+
+
+def _usage(file=None) -> None:
+    print(_USAGE, file=sys.stderr if file is None else file)
 
 
 def main(argv: list[str] | None = None) -> int:
     ensure_cache_env()
     args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] in (["--help"], ["-h"]):
+        _usage(sys.stdout)
+        return 0
     if args and args[0] == "distance":
         from xcheck.distance import main as distance_main
 

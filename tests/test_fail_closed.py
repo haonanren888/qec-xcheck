@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from xcheck.distance import main
+from xcheck.distance import SCOPE_PHRASE, main
 from xcheck.known.suite import prediction_matches_observable
 
 _D3 = Path(__file__).resolve().parents[1] / "examples" / "rotated_memory_z_d3_r3.stim"
@@ -301,3 +301,222 @@ def test_decoder_contract_and_unfinished_checks_do_not_pass(tmp_path, monkeypatc
     rendered = "\n".join(f"{name}\t{status}\t{exit_code}" for name, status, exit_code in cases)
     assert "\t0" not in rendered
     assert len(cases) == 16
+
+
+_ZERO_FAULTS = (
+    "0 faults tested; Stim search result is 2, so the derived cutoff is 0; "
+    "use --max-weight 1 to test single faults"
+)
+
+
+def test_help_exits_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path / "mpl"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    from xcheck.__main__ import main as program_main
+
+    assert program_main(["--help"]) == 0
+    assert program_main(["-h"]) == 0
+    assert program_main(["distance", "--help"]) == 0
+    assert program_main([]) == 2
+
+
+def test_default_weight_one_json_pair_fields_are_null():
+    code, payload = _json(
+        ["--circuit", str(_D3), "--decoder", "pymatching", "--json"]
+    )
+    assert code == 0
+    assert payload["status"] == "EXHAUSTIVE_NONE"
+    assert payload["singles_tested"] == 286
+    assert payload["pairs_tested"] is None
+    assert payload["pair_failures"] is None
+    assert "not enumerated" in payload["enumeration_note"]
+    text_code, text = _text(["--circuit", str(_D3), "--decoder", "pymatching"])
+    assert text_code == 0
+    assert "pair_failures: not enumerated" in text
+
+
+def test_cutoff_zero_is_unavailable_until_max_weight_one(tmp_path, monkeypatch):
+    import stim
+
+    monkeypatch.chdir(tmp_path)
+    stim.Circuit.generated(
+        "color_code:memory_xyz",
+        distance=3,
+        rounds=3,
+        after_clifford_depolarization=0.001,
+    ).to_file("color.stim")
+    code, payload = _json(["--circuit", "color.stim", "--decoder", "pymatching", "--json"])
+    assert code == 4
+    assert payload["status"] == "UNAVAILABLE"
+    assert payload["exit_code"] == 4
+    assert payload["singles_tested"] == 0
+    assert _ZERO_FAULTS in payload["message"]
+    assert SCOPE_PHRASE not in payload["message"]
+    assert "no counterexample" not in payload["message"]
+
+    code, payload = _json(
+        [
+            "--circuit",
+            "color.stim",
+            "--decoder",
+            "pymatching",
+            "--max-weight",
+            "1",
+            "--json",
+        ]
+    )
+    assert payload["checked_weight"] == 1
+    assert payload["singles_tested"] > 0
+    assert payload["pairs_tested"] is None
+    assert payload["pair_failures"] is None
+    assert "0 faults tested" not in payload["message"]
+    if payload["single_failures"]:
+        assert code == 1
+        assert payload["status"] == "COUNTEREXAMPLE"
+        assert payload["counterexamples"]
+    else:
+        assert code == 0
+        assert payload["status"] == "EXHAUSTIVE_NONE"
+        assert payload["message"].startswith(SCOPE_PHRASE)
+
+
+def test_factory_exception_is_unavailable_and_bad_args_stay_usage(tmp_path, monkeypatch):
+    module = tmp_path / "factory_boom.py"
+    module.write_text(
+        "def factory(dem):\n"
+        "    raise ValueError('Expected all detectors to have at least 4 coordinates')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "three.stim").write_text(_THREE, encoding="utf-8")
+    code, payload = _json(
+        [
+            "--circuit",
+            "three.stim",
+            "--decoder",
+            "custom:factory_boom:factory",
+            "--max-weight",
+            "1",
+            "--json",
+        ]
+    )
+    assert code == 4
+    assert payload["status"] == "UNAVAILABLE"
+    assert payload["exit_code"] == 4
+    assert "ValueError" in payload["message"]
+    assert "Expected all detectors to have at least 4 coordinates" in payload["message"]
+    assert main(["--circuit", "three.stim", "--max-weight", "3"]) == 2
+    assert main(["--circuit", "three.stim", "--timeout", "0"]) == 2
+    assert main(["--circuit", "three.stim", "--decoder", "custom:not_a_spec"]) == 2
+
+    code, payload = _json(
+        [
+            "--circuit",
+            "three.stim",
+            "--decoder",
+            "custom:missing_mod_zz:factory",
+            "--max-weight",
+            "1",
+            "--json",
+        ]
+    )
+    assert code == 4
+    assert payload["status"] == "UNAVAILABLE"
+    assert "missing_mod_zz" in payload["message"]
+    assert "ModuleNotFoundError" in payload["message"]
+
+
+def test_timeout_stops_without_claiming_no_counterexample(tmp_path, monkeypatch):
+    module = tmp_path / "sleepy.py"
+    module.write_text(
+        "import time\n"
+        "import numpy as np\n"
+        "\n"
+        "class Slow:\n"
+        "    def __init__(self, dem):\n"
+        "        self.n_obs = dem.num_observables\n"
+        "        self.calls = 0\n"
+        "\n"
+        "    def decode_batch(self, dets):\n"
+        "        self.calls += 1\n"
+        "        rows = np.atleast_2d(np.asarray(dets))\n"
+        "        if self.calls == 1:\n"
+        "            return np.ones((rows.shape[0], self.n_obs), dtype=np.uint8)\n"
+        "        time.sleep(1.5)\n"
+        "        return np.zeros((rows.shape[0], self.n_obs), dtype=np.uint8)\n"
+        "\n"
+        "def hit_then_sleep(dem):\n"
+        "    return Slow(dem)\n"
+        "\n"
+        "def always_sleep(dem):\n"
+        "    class Decoder:\n"
+        "        def decode_batch(self, dets):\n"
+        "            time.sleep(1.5)\n"
+        "            rows = np.atleast_2d(np.asarray(dets))\n"
+        "            return np.zeros((rows.shape[0], dem.num_observables), dtype=np.uint8)\n"
+        "    return Decoder()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "three.stim").write_text(_THREE, encoding="utf-8")
+
+    code, payload = _json(
+        [
+            "--circuit",
+            "three.stim",
+            "--decoder",
+            "custom:sleepy:always_sleep",
+            "--max-weight",
+            "1",
+            "--timeout",
+            "0.3",
+            "--json",
+        ]
+    )
+    assert code == 4
+    assert payload["status"] == "TIMEOUT"
+    assert payload["exit_code"] == 4
+    assert payload["counterexamples"] == []
+    assert SCOPE_PHRASE not in payload["message"]
+    assert "no counterexample" not in payload["message"]
+    assert "TIMEOUT" in payload["message"]
+
+    code, payload = _json(
+        [
+            "--circuit",
+            "three.stim",
+            "--decoder",
+            "custom:sleepy:hit_then_sleep",
+            "--max-weight",
+            "2",
+            "--timeout",
+            "0.3",
+            "--json",
+        ]
+    )
+    assert code == 1
+    assert payload["status"] == "COUNTEREXAMPLE"
+    assert payload["exit_code"] == 1
+    assert payload["counterexamples"]
+    assert "error(" in payload["counterexamples"][0]["dem"]
+    assert SCOPE_PHRASE not in payload["message"]
+    assert "no counterexample" not in payload["message"]
+
+
+def test_timeout_during_pairs_reports_partial_pair_failures():
+    """Claude 2026-11-20: a timeout during pair enumeration keeps COUNTEREXAMPLE and reports the partial pair count."""
+    import subprocess, sys, os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH=root)
+    p = subprocess.run([sys.executable, "-m", "xcheck", "distance", "--circuit",
+                        os.path.join(root, "examples", "rotated_memory_z_d5_r5.stim"),
+                        "--decoder", "pymatching-correlated", "--max-weight", "2", "--timeout", "1"],
+                       capture_output=True, text=True, env=env)
+    if "pair_failures: 1173/" in p.stdout:
+        return  # machine fast enough to finish inside the timeout; nothing partial to check
+    assert p.returncode == 1, p.stdout
+    assert "status: COUNTEREXAMPLE" in p.stdout
+    assert "pair_failures: partial (" in p.stdout
+    assert "pair_failures: not enumerated" not in p.stdout
